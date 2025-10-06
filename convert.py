@@ -56,3 +56,4 @@ with open("qa_data.json", "w", encoding="utf-8") as f:
 
 conn.close()
 print("Data exported to qa_data.json successfully!")
+
