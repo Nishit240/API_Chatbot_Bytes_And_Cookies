@@ -107,11 +107,11 @@ def format_for_html_display(text):
 # -------------------------
 pdfs = [
     {
-        "path": "NISHIT JAIN RESUME11.pdf",
+        "path": "pdf/NISHIT JAIN RESUME.pdf",
         "keywords": ["nishit", "programming skills", "training / internship", "internship", "projects", "education", "accomplishments"]
     },
     {
-        "path": "syllabus.pdf",
+        "path": "pdf/syllabus.pdf",
         "keywords": ["HTML", "CSS", "JavaScript", "Python", "OOPs", "SQL", "Data Structures", "Algorithms", "Networking", "Operating Systems", "Machine Learning"]
     }
 ]
