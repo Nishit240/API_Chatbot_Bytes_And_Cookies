@@ -7,8 +7,7 @@ from pydantic import BaseModel
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import uvicorn
-import html  # for escaping < and >
-
+import html
 
 # -------------------------
 # PDF reader that preserves formatting
@@ -30,11 +29,22 @@ def read_pdf_preserve_formatting(pdf_path):
                 for key in sorted(rows.keys()):
                     row = " ".join([t for _x, t in sorted(rows[key], key=lambda x: x[0])]).strip()
                     lines.append(row)
+
+            # Clean up each line (remove cid artifacts)
+            cleaned_lines = []
             for ln in lines:
-                all_lines.append(ln.rstrip())
+                # Remove (cid:###) patterns and extra spaces
+                ln = re.sub(r'\(cid:\d+\)', '', ln)
+                ln = re.sub(r'\s+', ' ', ln).strip()
+                cleaned_lines.append(ln.rstrip())
+
+            all_lines.extend(cleaned_lines)
             all_lines.append("")  # blank line between pages
+
+    # Remove trailing blank lines
     while len(all_lines) and all_lines[-1] == "":
         all_lines.pop()
+
     return "\n".join(all_lines)
 
 
@@ -124,10 +134,6 @@ for pdf_info in pdfs:
     sections = extract_sections(pdf_text, pdf_info["keywords"])
     all_data_list.extend(sections)
 
-print(f"✅ Loaded {len(all_data_list)} sections from all PDFs")
-for d in all_data_list:
-    print(" -", d["keyword"])
-
 answers = [item["answer"] for item in all_data_list]
 
 # -------------------------
@@ -180,7 +186,7 @@ def chat(query: Query):
             break
 
     # Lower threshold for short queries
-    threshold = 0.05
+    threshold = 0.08
     if confidence < threshold:
         return {"answer": "Sorry, I don't understand that question.", "confidence": confidence}
 
