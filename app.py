@@ -1,13 +1,16 @@
+import os
 import pdfplumber
 import re
 from collections import defaultdict
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import uvicorn
 import html
+import uvicorn
 
 # -------------------------
 # PDF reader that preserves formatting
@@ -30,18 +33,15 @@ def read_pdf_preserve_formatting(pdf_path):
                     row = " ".join([t for _x, t in sorted(rows[key], key=lambda x: x[0])]).strip()
                     lines.append(row)
 
-            # Clean up each line (remove cid artifacts)
             cleaned_lines = []
             for ln in lines:
-                # Remove (cid:###) patterns and extra spaces
                 ln = re.sub(r'\(cid:\d+\)', '', ln)
                 ln = re.sub(r'\s+', ' ', ln).strip()
                 cleaned_lines.append(ln.rstrip())
 
             all_lines.extend(cleaned_lines)
-            all_lines.append("")  # blank line between pages
+            all_lines.append("")
 
-    # Remove trailing blank lines
     while len(all_lines) and all_lines[-1] == "":
         all_lines.pop()
 
@@ -54,7 +54,7 @@ def read_pdf_preserve_formatting(pdf_path):
 def extract_sections(pdf_text, keywords):
     data_list = []
     text = pdf_text
-    url_pattern = re.compile(r'(https?://\S+)')  # Matches http or https links
+    url_pattern = re.compile(r'(https?://\S+)')
 
     for i, kw in enumerate(keywords):
         pattern_line = rf'(?m)^\s*{re.escape(kw)}\b'
@@ -77,85 +77,61 @@ def extract_sections(pdf_text, keywords):
             end_idx = min(next_positions)
 
         section_text = text[start_idx:end_idx].strip("\n\r ")
-
-        # Convert any URLs to clickable HTML links
         def replace_url(match):
             url = match.group(0)
             return f'<a href="{url}" target="_blank">{url}</a>'
-
         section_text = url_pattern.sub(replace_url, section_text)
 
-        data_list.append({
-            "keyword": kw,
-            "answer": section_text
-        })
+        data_list.append({"keyword": kw, "answer": section_text})
     return data_list
 
 
-
 # -------------------------
-# Format for safe HTML display
+# Format for HTML display
 # -------------------------
 def format_for_html_display(text):
-    # Escape everything first
     escaped = html.escape(text)
-
-    # Restore <a> tags for URLs (allow only <a> tags)
     escaped = re.sub(
         r'&lt;a href=&quot;(https?://[^&]+)&quot; target=&quot;_blank&quot;&gt;(https?://[^&]+)&lt;/a&gt;',
         r'<a href="\1" target="_blank">\2</a>',
         escaped
     )
-
-    # Preserve line breaks
     return escaped.replace("\n", "<br>\n")
 
 
-
 # -------------------------
-# Load multiple PDFs and build dataset
+# Load PDFs and prepare TF-IDF
 # -------------------------
 pdfs = [
-    {
-        "path": "pdf/NISHIT JAIN RESUME.pdf",
-        "keywords": ["nishit", "programming skills", "training / internship", "internship", "projects", "education", "accomplishments"]
-    },
-    {
-        "path": "pdf/syllabus.pdf",
-        "keywords": ["HTML", "CSS", "JavaScript", "Python", "OOPs", "SQL", "Data Structures", "Algorithms", "Networking", "Operating Systems", "Machine Learning"]
-    }
+    {"path": "pdf/NISHIT JAIN RESUME.pdf",
+     "keywords": ["nishit", "programming skills", "training / internship", "internship", "projects", "education", "accomplishments"]},
+    {"path": "pdf/syllabus.pdf",
+     "keywords": ["HTML", "CSS", "JavaScript", "Python", "OOPs", "SQL", "Data Structures", "Algorithms", "Networking", "Operating Systems", "Machine Learning"]}
 ]
 
 all_data_list = []
-
 for pdf_info in pdfs:
-    print(f"📄 Reading {pdf_info['path']}...")
     pdf_text = read_pdf_preserve_formatting(pdf_info["path"])
     sections = extract_sections(pdf_text, pdf_info["keywords"])
     all_data_list.extend(sections)
 
 answers = [item["answer"] for item in all_data_list]
-
-# -------------------------
-# Train TF-IDF on section content
-# -------------------------
 vectorizer = TfidfVectorizer(lowercase=True)
-if len(answers) == 0:
-    X = vectorizer.fit_transform([""])
-else:
-    X = vectorizer.fit_transform(answers)
+X = vectorizer.fit_transform(answers if answers else [""])
 
 
 # -------------------------
-# FastAPI app
+# FastAPI App
 # -------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # For production, replace * with your frontend domain
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 
 class Query(BaseModel):
@@ -168,24 +144,21 @@ def chat(query: Query):
     if not user_q:
         return {"answer": "Please type something!", "confidence": 1.0}
 
-    if len(answers) == 0:
-        return {"answer": "No sections found in the PDFs. Check keywords and files.", "confidence": 0.0}
+    if not answers:
+        return {"answer": "No sections found in the PDFs.", "confidence": 0.0}
 
-    # TF-IDF similarity
     user_vec = vectorizer.transform([user_q])
     similarity = cosine_similarity(user_vec, X)
     best_idx = int(similarity.argmax())
     confidence = float(similarity[0][best_idx])
 
-    # --- Exact keyword fallback ---
-    user_lower = user_q.lower()
+    # Exact keyword fallback
     for i, item in enumerate(all_data_list):
-        if user_lower == item["keyword"].lower():
+        if user_q.lower() == item["keyword"].lower():
             best_idx = i
             confidence = 1.0
             break
 
-    # Lower threshold for short queries
     threshold = 0.08
     if confidence < threshold:
         return {"answer": "Sorry, I don't understand that question.", "confidence": confidence}
@@ -200,8 +173,9 @@ def chat(query: Query):
 
 @app.get("/")
 def root():
-    return {"message": "Chatbot API running using multiple PDFs!"}
+    return {"message": "Chatbot API running with multiple PDFs!"}
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
