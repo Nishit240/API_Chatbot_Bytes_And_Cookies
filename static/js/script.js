@@ -1,7 +1,11 @@
+// const API_URL = "http://127.0.0.1:8000/chat";  // 👈 Local backend only
+// console.log("✅ Using API:", API_URL);
+
+
 // If deployed on Render → use your live Render domain
 const API_URL =
   window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
-    ? "http://127.0.0.1:10000/chat"
+    ? "http://127.0.0.1:8000/chat"
     : "https://chatbot-550d.onrender.com/chat";
 console.log("✅ Using API:", API_URL);
 

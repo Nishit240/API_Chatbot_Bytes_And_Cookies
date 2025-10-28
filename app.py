@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sklearn.feature_extraction.text import TfidfVectorizer
-import torch
+from sklearn.metrics.pairwise import cosine_similarity
+import html, re
 
 # -------------------------
 # Silence PDF warnings
@@ -19,30 +20,61 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pdfminer")
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 # -------------------------
-# Helper: Clean OCR / Extracted HTML
+# Helper: Clean extracted text
 # -------------------------
 def clean_extracted_html(escaped_html: str):
+    """Advanced cleaner specifically for messy law PDF-to-HTML extraction."""
+
     s = html.unescape(escaped_html)
-    replacements = [
-        (r'\bL c\b', 'Law'),
-        (r'\bL c\w*\b', 'Law'),
-        (r'\bontract\b', 'contract'),
-        (r'\bconntain(ed)?\b', 'contain'),
-        (r'1872a\b', '1872'),
-        (r'\bform a shop\b', 'from a shop'),
-        (r'\bride a bus\b', 'rides a bus'),
-        (r'\b\.\s*([A-Za-z])\s*</p>', r'.</p><p>\1'),
-    ]
-    for pat, repl in replacements:
-        s = re.sub(pat, repl, s, flags=re.IGNORECASE)
-    s = re.sub(r'<p>\s*[A-Za-z]\s*</p>', '', s)
-    s = re.sub(r'\b(?:[A-Za-z]\s+){2,5}\b', lambda m: m.group(0).replace(' ', ''), s)
-    s = re.sub(r'\s+\n', '\n', s)
-    s = re.sub(r'\s{2,}', ' ', s)
-    s = re.sub(r'\s+([,.;:])', r'\1', s)
-    s = re.sub(r'(\w)\s+(\')\s+(\w)', r"\1'\3", s)
+
+    # --- 1️⃣ Remove useless single-letter or junk <p> tags ---
+    s = re.sub(r'<p>\s*[a-zA-Z]\s*</p>', '', s)
+    s = re.sub(r'<p>\s*\d+\s*</p>', '', s)  # remove isolated page numbers
+    s = re.sub(r'<p>\s*(n|e|l|a|s|c|g|i|o|w)\s*</p>', '', s, flags=re.IGNORECASE)
+
+    # --- 2️⃣ Fix words broken across tags like "L c" → "Law", "ontract" → "contract" ---
+    s = re.sub(r'\bL\s*c\b', 'Law', s, flags=re.IGNORECASE)
+    s = re.sub(r'\b(ontract|ontrac|ontr|ontra)\b', 'contract', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bconntain(ed)?\b', 'contain', s, flags=re.IGNORECASE)
+    s = re.sub(r'1872a\b', '1872', s)
+    s = re.sub(r'\bform a shop\b', 'from a shop', s)
+    s = re.sub(r'\bride a bus\b', 'rides a bus', s)
+    s = re.sub(r'\brelawtes\b', 'relates', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bindcian\b', 'Indian', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bcontractse\b', 'contracts', s, flags=re.IGNORECASE)
+    s = re.sub(r'\btheere\b', 'there', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bcommunicalted\b', 'communicated', s, flags=re.IGNORECASE)
+
+    # --- 3️⃣ Join broken lines and normalize whitespace ---
+    s = re.sub(r'\s*\n\s*', ' ', s)  # join newlines
+    s = re.sub(r'\s{2,}', ' ', s)    # multiple spaces to one
+    s = re.sub(r'\s+([.,;:!?])', r'\1', s)
+    s = re.sub(r'([.,;:!?])([A-Za-z])', r'\1 \2', s)
+
+    # --- 4️⃣ Normalize HTML paragraph spacing ---
     s = re.sub(r'\s*</p>\s*<p>\s*', '</p>\n<p>', s)
+    s = re.sub(r'<p>\s*</p>', '', s)
+    s = re.sub(r'<h3>\s*</h3>', '', s)
+
+    # --- 5️⃣ Standardize section headings (Law PDFs often have misaligned H3 tags) ---
+    s = re.sub(r'<h3>\s*([A-Z][A-Z ]{2,})\s*</h3>', lambda m: f"<h3>{m.group(1).title()}</h3>", s)
+
+    # --- 6️⃣ Fix mid-word breaks like “agreemenet” → “agreement” ---
+    s = re.sub(r'\bagreemenet\b', 'agreement', s)
+    s = re.sub(r'\bforbCearances?\b', 'forbearance', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bbindling\b', 'binding', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bconaditions\b', 'conditions', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bwghom\b', 'whom', s, flags=re.IGNORECASE)
+
+    # --- 7️⃣ Add spacing between headings and text for readability ---
+    s = re.sub(r'(</h3>)(\s*<p>)', r'\1\n\2', s)
+    s = re.sub(r'(</p>)(\s*<h3>)', r'\1\n\2', s)
+
+    # --- 8️⃣ Final cleanup ---
+    s = s.strip()
+    s = re.sub(r'\s{2,}', ' ', s)
     return s
+
 
 # -------------------------
 # PDF Extraction as HTML
@@ -51,18 +83,11 @@ def extract_pdf_as_html(pdf_path):
     html_content = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
-            table_lines = set()
-            for table in tables:
-                for row in table:
-                    table_lines.add(" ".join([cell for cell in row if cell]))
-
             text_lines = page.extract_text().splitlines() if page.extract_text() else []
             page_html = ""
-
             for line in text_lines:
                 line = line.strip()
-                if not line or line in table_lines:
+                if not line:
                     continue
                 if line.isupper() and len(line.split()) <= 10:
                     page_html += f"<h3>{line}</h3>\n"
@@ -70,20 +95,7 @@ def extract_pdf_as_html(pdf_path):
                     page_html += f"<li>{line[1:].strip()}</li>\n"
                 else:
                     page_html += f"<p>{line}</p>\n"
-
-            # Add tables
-            for table in tables:
-                table_html = "<table border='1' style='border-collapse: collapse; width: 100%;'>\n"
-                for row in table:
-                    table_html += "<tr>"
-                    for cell in row:
-                        table_html += f"<td>{cell if cell else ''}</td>"
-                    table_html += "</tr>\n"
-                table_html += "</table>\n"
-                page_html += table_html
-
             html_content += page_html + "<hr>\n"
-
     return clean_extracted_html(html_content)
 
 # -------------------------
@@ -108,7 +120,7 @@ def extract_sections_by_keywords(text, keywords, window=300):
 # -------------------------
 # FastAPI setup
 # -------------------------
-app = FastAPI(title="PDF Chat API", version="1.0.0")
+app = FastAPI(title="PDF Chat API (Local Test)", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -121,10 +133,10 @@ class Query(BaseModel):
     query: str
 
 # -------------------------
-# PDF files and keywords
+# PDF and Keywords
 # -------------------------
 pdf_keywords = [
-    {
+        {
         "pdf": "pdf/extended_sample_table.pdf",
         "keywords": ["Extended Sample PDF with Table"]
     },
@@ -137,26 +149,41 @@ pdf_keywords = [
             "DEFINITIONS OF CONTRACT",
             "DISTINCTION BETWEEN CONTRACT & AGREEMENT",
             "Section 10",
-            "Proper Offer and Acceptance:",
-            "Intention to Create Legal Relationship",
-            "Capacity of Parties",
-            "Lawful Consideration",
-            "Lawful Object",
-            "Free Consent",
-            "On the basis of creation or formation",
-            "On the basis of validity or enforceability",
-            "On the basis of execution or performance",
-            "On the basis of liability",
-            "BETWEEN VOID AGREEMENT AND VOID CONTRACT",
-            "BETWEEN VOID AGREEMENT AND VOIDABLE CONTRACT",
-            "BETWEEN VOID CONTRACT & VOIDABLE CONTRACT",
-            "BETWEEN VOID AND ILLEGAL AGREEMENT"
+            "Proper Offer and Acceptance:"
         ]
     }
 ]
 
+# pdf_keywords = [
+#     {
+#         "pdf": "pdf/Law of Contract-I_removed.pdf",
+#         "keywords": [
+#             "Law of contract",
+#             "SCHEME OF THE ACT",
+#             "PRESENT FORM OF INDIAN CONTRACT ACT",
+#             "DEFINITIONS OF CONTRACT",
+#             "DISTINCTION BETWEEN CONTRACT & AGREEMENT",
+#             "Section 10",
+#             "Proper Offer and Acceptance:"
+#             # "Intention to Create Legal Relationship",
+#             # "Capacity of Parties",
+#             # "Lawful Consideration",
+#             # "Lawful Object",
+#             # "Free Consent",
+#             # "On the basis of creation or formation",
+#             # "On the basis of validity or enforceability",
+#             # "On the basis of execution or performance",
+#             # "On the basis of liability",
+#             # "BETWEEN VOID AGREEMENT AND VOID CONTRACT",
+#             # "BETWEEN VOID AGREEMENT AND VOIDABLE CONTRACT",
+#             # "BETWEEN VOID CONTRACT & VOIDABLE CONTRACT",
+#             # "BETWEEN VOID AND ILLEGAL AGREEMENT"
+#         ]
+#     }
+# ]
+
 # -------------------------
-# Load PDF content
+# Load and Process PDFs
 # -------------------------
 all_chunks = []
 chunk_mapping = []
@@ -171,74 +198,55 @@ for item in pdf_keywords:
         all_chunks.append(section)
         chunk_mapping.append(kw)
 
-# Save chunks to JSON
 os.makedirs("data", exist_ok=True)
 with open("data/pdf_chunks.json", "w", encoding="utf-8") as f:
     json.dump(
         [{"keyword": k, "chunk": c} for k, c in zip(chunk_mapping, all_chunks)],
         f, ensure_ascii=False, indent=4
     )
+
 print("✅ PDF sections saved to data/pdf_chunks.json")
 
 # -------------------------
-# Lazy load SentenceTransformer model
+# TF-IDF setup
 # -------------------------
-model = None
-emb_chunks = None
-
-def get_model():
-    global model, emb_chunks
-    if model is None:
-        from sentence_transformers import SentenceTransformer, util
-        print("⏳ Loading SentenceTransformer model...")
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        emb_chunks = model.encode(all_chunks, convert_to_tensor=True)
-        print("✅ Model loaded successfully!")
-    return model, emb_chunks
+vectorizer = TfidfVectorizer(stop_words="english")
+tfidf_matrix = vectorizer.fit_transform(all_chunks)
 
 # -------------------------
-# Chat endpoint
+# Endpoints
 # -------------------------
-# -------------------------
-# Chat endpoint
-# -------------------------
-
 @app.post("/chat")
 def chat(query: Query):
-    from sentence_transformers import util
     user_q = query.query.strip()
     if not user_q:
-        return {"answer": "Please type something!", "confidence": 1.0}
+        return {"answer": "Please type something!"}
 
-    model, emb_chunks = get_model()
-    user_emb = model.encode([user_q], convert_to_tensor=True)
-    similarity = util.cos_sim(user_emb, emb_chunks.clone()).squeeze(0)
-    sorted_idx = torch.argsort(similarity, descending=True)
+    user_vec = vectorizer.transform([user_q])
+    cosine_sim = cosine_similarity(user_vec, tfidf_matrix).flatten()
+    top_idx = cosine_sim.argsort()[::-1][:3]
 
     top_matches = []
-    for idx in sorted_idx[:3]:
+    for idx in top_idx:
         top_matches.append({
             "keyword": chunk_mapping[idx],
             "answer": all_chunks[idx],
-            "confidence": float(similarity[idx])
+            "confidence": float(cosine_sim[idx])
         })
-
     return {"top_matches": top_matches}
-
-# -------------------------
-# Health checks
-# -------------------------
-@app.get("/ping")
-def ping():
-    return {"message": "pong"}
-
+ 
 @app.get("/")
 def root():
-    return {"status": "running", "message": "PDF Chat API is live!"}
+    return {"status": "running", "message": " 🗃️ PDF Chat API is running locally"}
 
-# Serve static files separately (prevents route collision)
+# Static files (optional UI)
 if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+
 
 # -------------------------
 # Main entry point
