@@ -81,21 +81,61 @@ def clean_extracted_html(escaped_html: str):
 # -------------------------
 def extract_pdf_as_html(pdf_path):
     html_content = ""
+
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text_lines = page.extract_text().splitlines() if page.extract_text() else []
+        for page_num, page in enumerate(pdf.pages, start=1):
             page_html = ""
+
+            # 🧩 1️⃣ Extract tables
+            tables = page.extract_tables()
+            if tables:
+                for table in tables:
+                    page_html += "<table border='1' style='border-collapse:collapse;width:100%;'>\n"
+                    for row in table:
+                        page_html += "  <tr>\n"
+                        for cell in row:
+                            clean_cell = html.escape(cell.strip()) if cell else ""
+                            page_html += f"    <td style='padding:4px;border:1px solid #999;'>{clean_cell}</td>\n"
+                        page_html += "  </tr>\n"
+                    page_html += "</table>\n<br>\n"
+
+            # 📝 2️⃣ Extract normal text lines
+            text_lines = page.extract_text().splitlines() if page.extract_text() else []
+            in_list = False
+
             for line in text_lines:
                 line = line.strip()
                 if not line:
                     continue
+
+                # Heading detection
                 if line.isupper() and len(line.split()) <= 10:
-                    page_html += f"<h3>{line}</h3>\n"
-                elif line.startswith(("-", "•")):
-                    page_html += f"<li>{line[1:].strip()}</li>\n"
+                    if in_list:
+                        page_html += "</ul>\n"
+                        in_list = False
+                    page_html += f"<h3>{html.escape(line.title())}</h3>\n"
+
+                # Bullet points detection
+                elif line.startswith(("•", "-", "*")):
+                    if not in_list:
+                        page_html += "<ul>\n"
+                        in_list = True
+                    bullet_text = html.escape(line.lstrip("•-* ").strip())
+                    page_html += f"  <li>{bullet_text}</li>\n"
+
+                # Normal paragraph
                 else:
-                    page_html += f"<p>{line}</p>\n"
-            html_content += page_html + "<hr>\n"
+                    if in_list:
+                        page_html += "</ul>\n"
+                        in_list = False
+                    page_html += f"<p>{html.escape(line)}</p>\n"
+
+            if in_list:
+                page_html += "</ul>\n"
+
+            html_content += f"<!-- PAGE {page_num} -->\n" + page_html + "<hr>\n"
+
+    # Clean the generated HTML
     return clean_extracted_html(html_content)
 
 # -------------------------
