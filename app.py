@@ -1,297 +1,316 @@
 import os
-import pdfplumber
 import re
 import html
-import json
 import logging
 import warnings
+import requests
+from typing import Dict, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import html, re
 
 # -------------------------
-# Silence PDF warnings
+# Setup
 # -------------------------
-warnings.filterwarnings("ignore", category=UserWarning, module="pdfminer")
+warnings.filterwarnings("ignore")
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="📘 Smart PDF Chatbot", version="2.1")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------
-# Helper: Clean extracted text
+# Config
 # -------------------------
-def clean_extracted_html(escaped_html: str):
-    """Advanced cleaner specifically for messy law PDF-to-HTML extraction."""
+PDF_KEYWORD_DATA = {
+    "https://renaicon.in/storage/syllabus/images/A8YRAiNXEIX05H33IQbtVVyUd3HKCO9LjQ8FJBLG.pdf": {
+        "keywords": [
+            "Fundamentals of Contract Laws",
+            "Law of Contract",
+            "INDIAN CONTRACT ACT, 1872",
+            "DISTINCTION BETWEEN CONTRACT & AGREEMENT",
+            "Offer and Acceptance",
+            "ESSENTIAL ELEMENTS OF A VALID CONTRACT",
+            "Intention to Create Legal Relationship",
+            "CLASSIFICATION OF CONTRACTS",
+            "Void and Voidable Contracts"
+        ]
+    },
+    # Added Extended Sample link
+    # "https://extended-sample-table.tiiny.site": {
+    #     "keywords": [
+    #         "Extended Sample PDF with Table",
+    #         "Table Example",
+    #         "Column Structure",
+    #         "Row Details",
+    #         "Data Representation",
+    #         "Sample Chart"
+    #     ]
+    # }
+}
 
-    s = html.unescape(escaped_html)
-
-    # --- 1️⃣ Remove useless single-letter or junk <p> tags ---
-    s = re.sub(r'<p>\s*[a-zA-Z]\s*</p>', '', s)
-    s = re.sub(r'<p>\s*\d+\s*</p>', '', s)  # remove isolated page numbers
-    s = re.sub(r'<p>\s*(n|e|l|a|s|c|g|i|o|w)\s*</p>', '', s, flags=re.IGNORECASE)
-
-    # --- 2️⃣ Fix words broken across tags like "L c" → "Law", "ontract" → "contract" ---
-    s = re.sub(r'\bL\s*c\b', 'Law', s, flags=re.IGNORECASE)
-    s = re.sub(r'\b(ontract|ontrac|ontr|ontra)\b', 'contract', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bconntain(ed)?\b', 'contain', s, flags=re.IGNORECASE)
-    s = re.sub(r'1872a\b', '1872', s)
-    s = re.sub(r'\bform a shop\b', 'from a shop', s)
-    s = re.sub(r'\bride a bus\b', 'rides a bus', s)
-    s = re.sub(r'\brelawtes\b', 'relates', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bindcian\b', 'Indian', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bcontractse\b', 'contracts', s, flags=re.IGNORECASE)
-    s = re.sub(r'\btheere\b', 'there', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bcommunicalted\b', 'communicated', s, flags=re.IGNORECASE)
-
-    # --- 3️⃣ Join broken lines and normalize whitespace ---
-    s = re.sub(r'\s*\n\s*', ' ', s)  # join newlines
-    s = re.sub(r'\s{2,}', ' ', s)    # multiple spaces to one
-    s = re.sub(r'\s+([.,;:!?])', r'\1', s)
-    s = re.sub(r'([.,;:!?])([A-Za-z])', r'\1 \2', s)
-
-    # --- 4️⃣ Normalize HTML paragraph spacing ---
-    s = re.sub(r'\s*</p>\s*<p>\s*', '</p>\n<p>', s)
-    s = re.sub(r'<p>\s*</p>', '', s)
-    s = re.sub(r'<h3>\s*</h3>', '', s)
-
-    # --- 5️⃣ Standardize section headings (Law PDFs often have misaligned H3 tags) ---
-    s = re.sub(r'<h3>\s*([A-Z][A-Z ]{2,})\s*</h3>', lambda m: f"<h3>{m.group(1).title()}</h3>", s)
-
-    # --- 6️⃣ Fix mid-word breaks like “agreemenet” → “agreement” ---
-    s = re.sub(r'\bagreemenet\b', 'agreement', s)
-    s = re.sub(r'\bforbCearances?\b', 'forbearance', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bbindling\b', 'binding', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bconaditions\b', 'conditions', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bwghom\b', 'whom', s, flags=re.IGNORECASE)
-
-    # --- 7️⃣ Add spacing between headings and text for readability ---
-    s = re.sub(r'(</h3>)(\s*<p>)', r'\1\n\2', s)
-    s = re.sub(r'(</p>)(\s*<h3>)', r'\1\n\2', s)
-
-    # --- 8️⃣ Final cleanup ---
-    s = s.strip()
-    s = re.sub(r'\s{2,}', ' ', s)
-    return s
-
+PDF_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # -------------------------
-# PDF Extraction as HTML
+# PDF Extraction
 # -------------------------
-def extract_pdf_as_html(pdf_path):
+def clean_extracted_html(s: str) -> str:
+    s = html.unescape(s)
+    s = s.replace("", "→").replace("•", "→")
+    s = re.sub(r"(\w)\s*\n\s*(\w)", r"\1 \2", s)
+    s = re.sub(r"([a-z])\s*\n\s*([A-Z])", r"\1. \2", s)
+    s = re.sub(r"\bL\s*aw\b", "Law", s, flags=re.I)
+    s = re.sub(r"\b(ontract|ontrac|ontra)\b", "contract", s, flags=re.I)
+    s = re.sub(r"\s{2,}", " ", s)
+    s = s.replace("\n", "<br>")
+    return s.strip()
+
+
+def extract_pdf_as_html_from_url(url: str) -> str:
+    import pdfplumber
+    from io import BytesIO
+    if url in PDF_CACHE:
+        return PDF_CACHE[url]["html"]
+
+    logger.info(f"📥 Fetching PDF or HTML source: {url}")
+    resp = requests.get(url, timeout=25)
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("content-type", "")
+    if "pdf" not in content_type:
+        logger.warning("⚠️ Non-PDF content detected, treating as HTML text.")
+        PDF_CACHE[url] = {"html": html.escape(resp.text)}
+        return PDF_CACHE[url]["html"]
+
+    pdf_data = BytesIO(resp.content)
     html_content = ""
-
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            page_html = ""
-
-            # 🧩 1️⃣ Extract tables
-            tables = page.extract_tables()
-            if tables:
-                for table in tables:
-                    page_html += "<table border='1' style='border-collapse:collapse;width:100%;'>\n"
-                    for row in table:
-                        page_html += "  <tr>\n"
-                        for cell in row:
-                            clean_cell = html.escape(cell.strip()) if cell else ""
-                            page_html += f"    <td style='padding:4px;border:1px solid #999;'>{clean_cell}</td>\n"
-                        page_html += "  </tr>\n"
-                    page_html += "</table>\n<br>\n"
-
-            # 📝 2️⃣ Extract normal text lines
+    with pdfplumber.open(pdf_data) as pdf:
+        # ✅ Skip first page
+        for page in pdf.pages[1:]:
+            tables = page.extract_tables() or []
             text_lines = page.extract_text().splitlines() if page.extract_text() else []
-            in_list = False
+            page_html = ""
 
             for line in text_lines:
                 line = line.strip()
                 if not line:
                     continue
-
-                # Heading detection
-                if line.isupper() and len(line.split()) <= 10:
-                    if in_list:
-                        page_html += "</ul>\n"
-                        in_list = False
+                if re.match(r"^[A-Z][A-Z\s&\-]{2,}$", line) and len(line.split()) <= 10:
                     page_html += f"<h3>{html.escape(line.title())}</h3>\n"
-
-                # Bullet points detection
-                elif line.startswith(("•", "-", "*")):
-                    if not in_list:
-                        page_html += "<ul>\n"
-                        in_list = True
-                    bullet_text = html.escape(line.lstrip("•-* ").strip())
-                    page_html += f"  <li>{bullet_text}</li>\n"
-
-                # Normal paragraph
+                elif re.match(r"^(\s*[-•→]|^\d+\.)", line):
+                    page_html += f"<li>{html.escape(line.lstrip('-•→').strip())}</li>\n"
                 else:
-                    if in_list:
-                        page_html += "</ul>\n"
-                        in_list = False
                     page_html += f"<p>{html.escape(line)}</p>\n"
 
-            if in_list:
-                page_html += "</ul>\n"
+            for t in tables:
+                table_html = "<table border='1' style='border-collapse:collapse;width:100%;margin:10px 0;'>"
+                for row in t:
+                    table_html += "<tr>" + "".join(
+                        f"<td style='padding:6px;border:1px solid #999;font-family:Arial;'>{html.escape(str(cell or ''))}</td>"
+                        for cell in row
+                    ) + "</tr>"
+                table_html += "</table>\n"
+                page_html += table_html
 
-            html_content += f"<!-- PAGE {page_num} -->\n" + page_html + "<hr>\n"
+            html_content += page_html + "<hr>\n"
 
-    # Clean the generated HTML
-    return clean_extracted_html(html_content)
-
-# -------------------------
-# Extract sections by keywords
-# -------------------------
-def extract_sections_by_keywords(text, keywords, window=300):
-    sections = {}
-    lower_text = text.lower()
-    words = text.split()
-    for kw in keywords:
-        kw_lower = kw.lower()
-        idx = lower_text.find(kw_lower)
-        if idx != -1:
-            word_index = len(text[:idx].split())
-            start = max(0, word_index - int(window / 4))
-            end = min(len(words), word_index + window)
-            sections[kw] = " ".join(words[start:end])
-        else:
-            sections[kw] = "❌ Keyword not found in PDF."
-    return sections
+    cleaned = clean_extracted_html(html_content)
+    PDF_CACHE[url] = {"html": cleaned}
+    return cleaned
 
 # -------------------------
-# FastAPI setup
+# Models
 # -------------------------
-app = FastAPI(title="PDF Chat API (Local Test)", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
-class Query(BaseModel):
+class QueryRequest(BaseModel):
     query: str
+    pdf_url: str
 
 # -------------------------
-# PDF and Keywords
+# Extract section after heading
 # -------------------------
-pdf_keywords = [
-        {
-        "pdf": "pdf/extended_sample_table.pdf",
-        "keywords": ["Extended Sample PDF with Table"]
-    },
-    {
-        "pdf": "pdf/Law of Contract-I_removed.pdf",
-        "keywords": [
-            "Law of contract",
-            "SCHEME OF THE ACT",
-            "PRESENT FORM OF INDIAN CONTRACT ACT",
-            "DEFINITIONS OF CONTRACT",
-            "DISTINCTION BETWEEN CONTRACT & AGREEMENT",
-            "Section 10",
-            "Proper Offer and Acceptance:"
-        ]
-    }
-]
+def extract_section_after_heading(html_text: str, heading: str, word_limit: int = 400):
+    if not html_text or not heading:
+        return None
 
-# pdf_keywords = [
-#     {
-#         "pdf": "pdf/Law of Contract-I_removed.pdf",
-#         "keywords": [
-#             "Law of contract",
-#             "SCHEME OF THE ACT",
-#             "PRESENT FORM OF INDIAN CONTRACT ACT",
-#             "DEFINITIONS OF CONTRACT",
-#             "DISTINCTION BETWEEN CONTRACT & AGREEMENT",
-#             "Section 10",
-#             "Proper Offer and Acceptance:"
-#             # "Intention to Create Legal Relationship",
-#             # "Capacity of Parties",
-#             # "Lawful Consideration",
-#             # "Lawful Object",
-#             # "Free Consent",
-#             # "On the basis of creation or formation",
-#             # "On the basis of validity or enforceability",
-#             # "On the basis of execution or performance",
-#             # "On the basis of liability",
-#             # "BETWEEN VOID AGREEMENT AND VOID CONTRACT",
-#             # "BETWEEN VOID AGREEMENT AND VOIDABLE CONTRACT",
-#             # "BETWEEN VOID CONTRACT & VOIDABLE CONTRACT",
-#             # "BETWEEN VOID AND ILLEGAL AGREEMENT"
-#         ]
-#     }
-# ]
+    merged = re.sub(r"\s{2,}", " ", html_text)
+    head_tokens = re.escape(heading.strip()).replace("\\ ", r"\s+")
+    head_re = re.compile(rf"(?i){head_tokens}")
+
+    m = head_re.search(merged)
+    if not m:
+        parts = heading.strip().split()
+        if len(parts) >= 2:
+            partial = re.escape(" ".join(parts[:2])).replace("\\ ", r"\s+")
+            m = re.search(rf"(?i){partial}", merged)
+    if not m:
+        return None
+
+    start = m.end()
+    region = merged[start:start + 8000]
+
+    table_match = re.search(r"(<table\b.*?>.*?</table>)", region, flags=re.I | re.S)
+    if table_match:
+        table_html = table_match.group(1)
+        if "style=" not in table_html:
+            table_html = table_html.replace(
+                "<table",
+                "<table border='1' style='border-collapse:collapse;width:100%;margin:10px 0;'>",
+                1
+            )
+        return f"<div class='formatted-answer'><h4>{heading}</h4>{table_html}</div>"
+
+    text_only = re.sub(r"<[^>]+>", " ", region)
+    text_only = re.sub(r"\s{2,}", " ", text_only).strip()
+    words = text_only.split()
+    snippet = " ".join(words[:word_limit])
+    if not snippet:
+        return None
+
+    snippet = re.sub(r'\s*([.?!])\s*', r'\1 ', snippet)
+    snippet = re.sub(r'([.?!])\s+(?=[A-Z])', r'\1<br><br>', snippet)
+    snippet = snippet.strip()
+
+    snippet = "<p>" + snippet.replace("\n", "<br>") + "</p>"
+    return f"<div class='formatted-answer'><h4>{heading}</h4>{snippet}</div>"
 
 # -------------------------
-# Load and Process PDFs
+# Formatting
 # -------------------------
-all_chunks = []
-chunk_mapping = []
+def format_for_readability(raw_text: str) -> str:
+    if not raw_text or raw_text.startswith("❌"):
+        return raw_text
 
-for item in pdf_keywords:
-    if not os.path.exists(item["pdf"]):
-        print(f"⚠️ Missing file: {item['pdf']}")
-        continue
-    pdf_content = extract_pdf_as_html(item["pdf"])
-    keyword_sections = extract_sections_by_keywords(pdf_content, item["keywords"])
-    for kw, section in keyword_sections.items():
-        all_chunks.append(section)
-        chunk_mapping.append(kw)
+    if re.search(r"</?(table|tr|td|th)[\s>]", raw_text, flags=re.I):
+        formatted = re.sub(r'([.?!])\s+(?=[A-Z])', r'\1<br><br>', raw_text)
+        return f"<div class='formatted-answer'>{formatted}</div>"
 
-os.makedirs("data", exist_ok=True)
-with open("data/pdf_chunks.json", "w", encoding="utf-8") as f:
-    json.dump(
-        [{"keyword": k, "chunk": c} for k, c in zip(chunk_mapping, all_chunks)],
-        f, ensure_ascii=False, indent=4
-    )
+    text = html.escape(raw_text)
+    text = text.replace("->", "→").replace("➢", "→").replace("", "→")
+    text = re.sub(r'\s{2,}', ' ', text)
 
-print("✅ PDF sections saved to data/pdf_chunks.json")
+    bold_words = [
+        "Section", "Definition", "Case", "Elements", "Types", "Basis",
+        "Example", "Law", "Contract", "Agreement", "Offer", "Acceptance",
+        "Consideration", "Enforceability", "Void", "Valid", "Essential",
+        "Consent", "Object", "Proposal", "Promise", "Obligation", "Remedies",
+        "Specific", "Relief", "Act"
+    ]
+    for word in bold_words:
+        text = re.sub(rf"\b({word}s?)\b", r"<b>\1</b>", text, flags=re.I)
+
+    text = re.sub(r"(UNIT\s+[IVXLC]+:?)", r"<h4>\1</h4>", text, flags=re.I)
+
+    parts = re.split(r"(<h4>.*?</h4>)", text)
+    formatted = []
+
+    for part in parts:
+        if not part.strip():
+            continue
+
+        if part.startswith("<h4>"):
+            formatted.append(part)
+            continue
+
+        lines = re.split(r"(?=→)", part)
+        list_items = []
+        normal_lines = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("→"):
+                clean_item = line.lstrip("→").strip()
+                list_items.append(f"<li>{clean_item}</li>")
+            else:
+                line = re.sub(r'([.?!])\s+(?=[A-Z])', r'\1<br><br>', line)
+                normal_lines.append(f"<p>{line}</p>")
+
+        if list_items:
+            formatted.append("<ul>" + "".join(list_items) + "</ul>")
+        formatted.extend(normal_lines)
+
+    final_html = "\n".join(formatted)
+    return f"<div class='formatted-answer'>{final_html}</div>"
 
 # -------------------------
-# TF-IDF setup
-# -------------------------
-vectorizer = TfidfVectorizer(stop_words="english")
-tfidf_matrix = vectorizer.fit_transform(all_chunks)
-
-# -------------------------
-# Endpoints
+# /chat Endpoint
 # -------------------------
 @app.post("/chat")
-def chat(query: Query):
-    user_q = query.query.strip()
-    if not user_q:
-        return {"answer": "Please type something!"}
+def chat_endpoint(req: QueryRequest):
+    try:
+        pdf_url = req.pdf_url.strip()
+        query = req.query.strip()
 
-    user_vec = vectorizer.transform([user_q])
-    cosine_sim = cosine_similarity(user_vec, tfidf_matrix).flatten()
-    top_idx = cosine_sim.argsort()[::-1][:3]
+        if pdf_url not in PDF_KEYWORD_DATA:
+            return JSONResponse(
+                content={"error": f"PDF URL not authorized: {pdf_url}"}, status_code=403
+            )
 
-    top_matches = []
-    for idx in top_idx:
-        top_matches.append({
-            "keyword": chunk_mapping[idx],
-            "answer": all_chunks[idx],
-            "confidence": float(cosine_sim[idx])
-        })
-    return {"top_matches": top_matches}
- 
+        html_text = extract_pdf_as_html_from_url(pdf_url)
+        keywords = PDF_KEYWORD_DATA[pdf_url]["keywords"]
+
+        vectorizer = TfidfVectorizer(stop_words="english")
+        corpus = [query] + keywords
+        vectors = vectorizer.fit_transform(corpus)
+        sims = cosine_similarity(vectors[0:1], vectors[1:]).flatten()
+
+        top_idxs = sims.argsort()[::-1][:3]
+        top_matches = []
+
+        for idx in top_idxs:
+            kw = keywords[idx]
+            conf = float(sims[idx])
+            section_text = extract_section_after_heading(html_text, kw)
+
+            if not section_text or len(section_text.strip()) < 20:
+                section_text = "❌ No relevant content found in the PDF."
+
+            formatted = format_for_readability(section_text)
+
+            top_matches.append({
+                "keyword": kw,
+                "answer": formatted,
+                "confidence": round(conf, 4)
+            })
+
+        top_matches = sorted(top_matches, key=lambda x: x["confidence"], reverse=True)
+        response_data = {"pdf_url": pdf_url, "top_matches": top_matches}
+        return JSONResponse(content=response_data)
+
+    except Exception as e:
+        logger.exception("Error in chat endpoint")
+        return JSONResponse(
+            content={"error": f"Internal Server Error: {str(e)}"},
+            status_code=500
+        )
+
+
 @app.get("/")
 def root():
-    return {"status": "running", "message": " 🗃️ PDF Chat API is running locally"}
-
-# Static files (optional UI)
-if os.path.exists("static"):
-    app.mount("/static", StaticFiles(directory="static", html=True), name="static")
-
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+    return {"message": "✅ Smart Legal PDF Chatbot API running!"}
 
 
-# -------------------------
-# Main entry point
-# -------------------------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Render injects PORT automatically
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+
+
+# ---------------------
+# Main entry point (Render)
+# -------------------------
+# if __name__ == "__main__":
+#     import uvicorn
+#     port = int(os.environ.get("PORT", 8000))  # Render injects PORT automatically
+#     uvicorn.run("app:app", host="0.0.0.0", port=port)

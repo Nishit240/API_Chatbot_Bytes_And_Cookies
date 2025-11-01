@@ -142,6 +142,31 @@ body {
 /* --------------------------
    PDF formatting in bot messages
 --------------------------- */
+
+.formatted-answer table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-family: 'Arial', sans-serif;
+  text-align: center;
+}
+
+.formatted-answer th,
+.formatted-answer td {
+  border: 1px solid #555;
+  padding: 8px;
+}
+
+.formatted-answer tr:nth-child(1) td {
+  background-color: #b7ce97;
+  font-weight: bold;
+}
+
+.formatted-answer tr:nth-child(2) td {
+  background-color: #dbe7c2;
+  font-weight: bold;
+}
+
 .message.bot table {
     border-collapse: collapse;
     width: 100%;
@@ -164,6 +189,44 @@ body {
 
 .message.bot li {
     margin-left: 20px;
+}
+
+.message.bot b {
+  color: #0f80f8;
+}
+
+.message.bot i {
+  color: #aaa;
+}
+
+.message.bot div {
+  margin-top: 5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+
+.match-btn {
+  background-color: #002f76;
+  color: white;
+  border: none;
+  padding: 10px 16px;
+  margin: 6px 0;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 14px;
+  width: 100%;
+  text-align: left;
+  transition: background-color 0.2s ease, transform 0.1s ease;
+}
+
+.match-btn small {
+  color: #e0e0e0;
+}
+
+.match-btn:hover {
+  background-color: #0051a7;
+  transform: scale(1.02);
 }
 
 
