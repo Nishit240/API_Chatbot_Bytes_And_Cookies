@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: pdf-preprocess
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -k uvicorn.workers.UvicornWorker app_preprocess.app:app --bind 0.0.0.0:$PORT"
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+  - type: web
+    name: pdf-chat
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -k uvicorn.workers.UvicornWorker app_chat.app:app --bind 0.0.0.0:$PORT"
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PDF_PREPROCESS_URL
+        value: "https://pdf-preprocess.onrender.com"
+
+disk:
+  name: shared-cache
+  mountPath: /data
+  sizeGB: 1
