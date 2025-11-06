@@ -80,16 +80,16 @@ def home():
 
 # ===============================
 # 🔹 Local Run
-# # ===============================
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
-
-
-# ---------------------
-# Main entry point (Render)
-## -------------------------
+# ===============================
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Render injects PORT automatically
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+
+
+# # ---------------------
+# # Main entry point (Render)
+# ## -------------------------
+# if __name__ == "__main__":
+#     import uvicorn
+#     port = int(os.environ.get("PORT", 8000))  # Render injects PORT automatically
+#     uvicorn.run("app:app", host="0.0.0.0", port=port)

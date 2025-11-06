@@ -3,24 +3,19 @@ import re
 import html
 import logging
 import requests
-import fitz  # PyMuPDF
+import fitz
 import pdfplumber
 from io import BytesIO
 import warnings
 
-# -------------------------
-# Setup logging & suppress noisy warnings
-# -------------------------
-warnings.filterwarnings("ignore", message=".*invalid float value.*", category=UserWarning)
-warnings.filterwarnings("ignore", message=".*Cannot set gray non-stroke color.*", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-
+warnings.filterwarnings("ignore", message="Cannot set gray non-stroke color")
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # -------------------------
-# Clean and normalize text
+# Helper: Clean and format extracted text
 # -------------------------
+
 def _clean_text(s: str) -> str:
     s = html.unescape(s or "")
     s = s.replace("", "→").replace("•", "→").replace("➢", "→")
@@ -33,34 +28,26 @@ def _clean_text(s: str) -> str:
     return s.strip()
 
 # -------------------------
-# Table → HTML
+# Helper: Convert table data → HTML
 # -------------------------
 def _table_to_html(table):
-    html_table = (
-        "<table border='1' "
-        "style='border-collapse:collapse;width:100%;text-align:left;font-family:Calibri,sans-serif;'>"
-    )
-    for i, row in enumerate(table):
+    html_table = "<table border='1' style='border-collapse:collapse;width:100%;text-align:left;'>"
+    for row in table:
         html_table += "<tr>"
         for cell in row:
-            cell_text = html.escape(str(cell or "").strip())
-            if i == 0:
-                # header row
-                html_table += (
-                    f"<th style='background-color:#d9ead3;padding:8px;font-weight:bold;'>{cell_text}</th>"
-                )
-            else:
-                html_table += f"<td style='padding:6px'>{cell_text}</td>"
+            cell_text = html.escape(str(cell or "")).strip()
+            html_table += f"<td style='padding:6px'>{cell_text}</td>"
         html_table += "</tr>"
     html_table += "</table><br>"
     return html_table
 
 # -------------------------
-# Convert PDF → HTML (Preserves tables)
+# Convert PDF → HTML (Preserves tables, headings, lists, etc.)
 # -------------------------
 def convert_pdf_to_html(pdf_source: str, html_path: str, force: bool = False):
     """
-    Convert a local or remote PDF to clean HTML (tables, headings, paragraphs).
+    Convert a local or remote PDF to clean HTML.
+    Preserves tables, headings, lists, and paragraph structure.
     """
     os.makedirs(os.path.dirname(html_path), exist_ok=True)
 
@@ -68,31 +55,34 @@ def convert_pdf_to_html(pdf_source: str, html_path: str, force: bool = False):
         logger.info("✅ Cache exists — skipping conversion: %s", html_path)
         return
 
-    # Read bytes
+    # Fetch bytes (remote or local)
     if isinstance(pdf_source, str) and pdf_source.lower().startswith("http"):
-        logger.info(f"🌐 Downloading remote PDF: {pdf_source}")
+        logger.info("🌐 Downloading remote PDF: %s", pdf_source)
         r = requests.get(pdf_source, timeout=20)
         r.raise_for_status()
         pdf_bytes = r.content
+        pdf_stream = BytesIO(pdf_bytes)
     else:
         if not os.path.exists(pdf_source):
             raise FileNotFoundError(f"❌ PDF not found: {pdf_source}")
         with open(pdf_source, "rb") as f:
             pdf_bytes = f.read()
-
-    pdf_stream = BytesIO(pdf_bytes)
-    html_content = ["<html><body>"]
+        pdf_stream = BytesIO(pdf_bytes)
 
     try:
-        # Try structured extraction (tables + text)
+        html_content = ["<html><body>"]
+
+        # -------- Try pdfplumber for table + text --------
         try:
             with pdfplumber.open(pdf_stream) as pdf:
                 for i, page in enumerate(pdf.pages, start=1):
                     html_content.append(f"<h3>Page {i}</h3>")
+                    # Extract text
                     text = page.extract_text() or ""
                     if text.strip():
                         html_content.append(f"<p>{html.escape(text)}</p>")
 
+                    # Extract tables
                     tables = page.extract_tables()
                     for table in tables:
                         if table and any(any(cell for cell in row) for row in table):
@@ -101,24 +91,27 @@ def convert_pdf_to_html(pdf_source: str, html_path: str, force: bool = False):
                     html_content.append("<hr>")
 
         except Exception as e:
-            logger.warning(f"⚠️ Structured extraction failed: {e}")
-            # fallback to PyMuPDF
+            logger.warning("⚠️ Structured extraction failed: %s", e)
+
+            # Fallback to PyMuPDF text extraction
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             for i, page in enumerate(doc, start=1):
                 html_content.append(f"<h3>Page {i}</h3>")
-                html_content.append(page.get_text("html") or "")
+                page_html = page.get_text("html") or ""
+                html_content.append(page_html)
                 html_content.append("<hr>")
 
         html_content.append("</body></html>")
-        cleaned_html = _clean_text("".join(html_content))
+        raw_html = "".join(html_content)
+        cleaned = _clean_text(raw_html)
 
         with open(html_path, "w", encoding="utf-8") as fh:
-            fh.write(cleaned_html)
+            fh.write(cleaned)
 
-        logger.info(f"✅ Converted & cached: {os.path.basename(html_path)}")
+        logger.info("✅ Converted & cached: %s", os.path.basename(html_path))
 
     except Exception as e:
-        logger.exception(f"❌ Conversion failed for {pdf_source}")
+        logger.exception("❌ Conversion failed for %s", pdf_source)
         raise
 
 # -------------------------
@@ -135,11 +128,13 @@ def load_cached_html(pdf_name: str, cache_dir: str = None) -> str:
         return f.read()
 
 # -------------------------
-# Extract section after heading
+# Extract Section
 # -------------------------
 def extract_section_after_heading(html_text: str, heading: str, word_limit: int = 400):
+    """Find section text after a specific heading or keyword."""
     if not html_text or not heading:
         return None
+
     heading_norm = heading.strip()
     header_re = re.compile(r"(<h[1-6][^>]*>.*?</h[1-6]>)", re.I | re.S)
     headers = []
@@ -150,20 +145,21 @@ def extract_section_after_heading(html_text: str, heading: str, word_limit: int 
     if headers:
         for i, h in enumerate(headers):
             start = h["start"]
-            end = headers[i + 1]["start"] if i + 1 < len(headers) else len(html_text)
+            end = headers[i+1]["start"] if i+1 < len(headers) else len(html_text)
             if h["title"].lower() == heading_norm.lower():
                 return html_text[start:end]
 
+    # fallback snippet near first occurrence
     m = re.search(rf"(?i){re.escape(heading_norm)}", html_text)
     if not m:
         return None
-    snippet = html_text[m.start() : m.start() + 8000]
+    snippet = html_text[m.start(): m.start()+8000]
     snippet_text = re.sub(r"<[^>]+>", " ", snippet)
     snippet_text = " ".join(snippet_text.split()[:word_limit])
     return f"<div class='formatted-answer'><h4>{heading}</h4><p>{snippet_text}</p></div>"
 
 # -------------------------
-# Format for readability
+# Readability Formatter
 # -------------------------
 def format_for_readability(raw_html: str) -> str:
     if not raw_html:
